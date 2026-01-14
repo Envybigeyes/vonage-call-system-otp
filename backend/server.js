@@ -1,16 +1,17 @@
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
-const { db, initDatabase } = require('./database');
+const Database = require('better-sqlite3');
+const path = require('path');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Initialize database tables first
-initDatabase();
+// Database update on startup
+const dbPath = path.join(__dirname, 'calls.db');
+const db = new Database(dbPath);
 
-// Then add call_state column if it doesn't exist
 try {
   const tableInfo = db.prepare("PRAGMA table_info(calls)").all();
   const hasCallState = tableInfo.some(col => col.name === 'call_state');
@@ -18,11 +19,13 @@ try {
   if (!hasCallState) {
     console.log('Adding call_state column to calls table...');
     db.prepare('ALTER TABLE calls ADD COLUMN call_state TEXT').run();
-    console.log('✅ call_state column added successfully');
+    console.log('✅ Database updated successfully');
   }
 } catch (err) {
   console.error('Database update error:', err);
 }
+
+db.close();
 
 // Load routes
 const advancedCalls = require('./routes/advanced-calls');
